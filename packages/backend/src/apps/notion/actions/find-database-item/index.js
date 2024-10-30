@@ -39,7 +39,7 @@ export default defineAction({
 
     const body = {
       filter: {
-        property: 'Name',
+        property: 'Title',
         rich_text: {
           equals: truncatedName,
         },
