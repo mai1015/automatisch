@@ -24,7 +24,7 @@ export default defineAction({
     );
 
     $.setActionItem({
-      raw: data.results[0],
+      raw: data,
     });
   },
 });
