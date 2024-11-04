@@ -88,15 +88,13 @@ class Flow extends Base {
     },
   });
 
-  static async afterFind(args) {
-    const { result } = args;
-
-    const referenceFlow = result[0];
+  static async populateStatusProperty(flows) {
+    const referenceFlow = flows[0];
 
     if (referenceFlow) {
       const shouldBePaused = await referenceFlow.isPaused();
 
-      for (const flow of result) {
+      for (const flow of flows) {
         if (!flow.active) {
           flow.status = 'draft';
         } else if (flow.active && shouldBePaused) {
@@ -106,6 +104,10 @@ class Flow extends Base {
         }
       }
     }
+  }
+
+  static async afterFind(args) {
+    await this.populateStatusProperty(args.result);
   }
 
   async lastInternalId() {
@@ -151,32 +153,46 @@ class Flow extends Base {
     });
   }
 
-  async createActionStep(previousStepId) {
-    const previousStep = await this.$relatedQuery('steps')
-      .findById(previousStepId)
-      .throwIfNotFound();
+  async getStepById(stepId) {
+    return await this.$relatedQuery('steps').findById(stepId).throwIfNotFound();
+  }
 
-    const createdStep = await this.$relatedQuery('steps').insertAndFetch({
+  async insertActionStepAtPosition(position) {
+    return await this.$relatedQuery('steps').insertAndFetch({
       type: 'action',
-      position: previousStep.position + 1,
+      position,
     });
+  }
 
-    const nextSteps = await this.$relatedQuery('steps')
-      .where('position', '>=', createdStep.position)
-      .whereNot('id', createdStep.id);
+  async getStepsAfterPosition(position) {
+    return await this.$relatedQuery('steps').where('position', '>', position);
+  }
 
-    const nextStepQueries = nextSteps.map(async (nextStep, index) => {
-      return await nextStep.$query().patchAndFetch({
-        position: createdStep.position + index + 1,
+  async updateStepPositionsFrom(startPosition, steps) {
+    const stepPositionUpdates = steps.map(async (step, index) => {
+      return await step.$query().patch({
+        position: startPosition + index,
       });
     });
 
-    await Promise.all(nextStepQueries);
+    return await Promise.all(stepPositionUpdates);
+  }
+
+  async createStepAfter(previousStepId) {
+    const previousStep = await this.getStepById(previousStepId);
+
+    const nextSteps = await this.getStepsAfterPosition(previousStep.position);
+
+    const createdStep = await this.insertActionStepAtPosition(
+      previousStep.position + 1
+    );
+
+    await this.updateStepPositionsFrom(createdStep.position + 1, nextSteps);
 
     return createdStep;
   }
 
-  async delete() {
+  async unregisterWebhook() {
     const triggerStep = await this.getTriggerStep();
     const trigger = await triggerStep?.getTriggerCommand();
 
@@ -197,15 +213,33 @@ class Flow extends Base {
         );
       }
     }
+  }
 
+  async deleteExecutionSteps() {
     const executionIds = (
       await this.$relatedQuery('executions').select('executions.id')
     ).map((execution) => execution.id);
 
-    await ExecutionStep.query().delete().whereIn('execution_id', executionIds);
+    return await ExecutionStep.query()
+      .delete()
+      .whereIn('execution_id', executionIds);
+  }
 
-    await this.$relatedQuery('executions').delete();
-    await this.$relatedQuery('steps').delete();
+  async deleteExecutions() {
+    return await this.$relatedQuery('executions').delete();
+  }
+
+  async deleteSteps() {
+    return await this.$relatedQuery('steps').delete();
+  }
+
+  async delete() {
+    await this.unregisterWebhook();
+
+    await this.deleteExecutionSteps();
+    await this.deleteExecutions();
+    await this.deleteSteps();
+
     await this.$query().delete();
   }
 
@@ -364,22 +398,18 @@ class Flow extends Base {
     });
   }
 
-  async $beforeUpdate(opt, queryContext) {
-    await super.$beforeUpdate(opt, queryContext);
-
-    if (!this.active) return;
-
-    const oldFlow = opt.old;
-
-    const incompleteStep = await oldFlow.$relatedQuery('steps').findOne({
+  async throwIfHavingIncompleteSteps() {
+    const incompleteStep = await this.$relatedQuery('steps').findOne({
       status: 'incomplete',
     });
 
     if (incompleteStep) {
       throw Flow.IncompleteStepsError;
     }
+  }
 
-    const allSteps = await oldFlow.$relatedQuery('steps');
+  async throwIfHavingLessThanTwoSteps() {
+    const allSteps = await this.$relatedQuery('steps');
 
     if (allSteps.length < 2) {
       throw new ValidationError({
@@ -394,17 +424,27 @@ class Flow extends Base {
         type: 'insufficientStepsError',
       });
     }
+  }
 
-    return;
+  async $beforeUpdate(opt, queryContext) {
+    await super.$beforeUpdate(opt, queryContext);
+
+    if (this.active) {
+      await opt.old.throwIfHavingIncompleteSteps();
+
+      await opt.old.throwIfHavingLessThanTwoSteps();
+    }
   }
 
   async $afterInsert(queryContext) {
     await super.$afterInsert(queryContext);
+
     Telemetry.flowCreated(this);
   }
 
   async $afterUpdate(opt, queryContext) {
     await super.$afterUpdate(opt, queryContext);
+
     Telemetry.flowUpdated(this);
   }
 }
